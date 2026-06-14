@@ -5,123 +5,148 @@ import io
 
 st.set_page_config(page_title="Evaluación de Fórmulas y Nutrientes", layout="wide")
 
-st.title("🧬 Módulo Avanzado: Costos, Precios y Nutrientes")
-st.markdown("Carga tu archivo de fórmulas para estructurar materias primas y nutrientes de forma vertical.")
+st.title("🧪 Módulo de Separación Avanzada: Ingredientes y Nutrientes")
+st.markdown("Carga tu archivo de formulación. El sistema separará la información en dos hojas independientes manteniendo el alineamiento exacto por columnas (Dummy / Proyecto).")
 
-archivo_cargado = st.file_uploader("Selecciona el archivo de Excel de Fórmulas (.xlsx)", type=["xlsx"])
+archivo_cargado = st.file_uploader("Selecciona el archivo de Excel (.xlsx)", type=["xlsx"])
 
 if archivo_cargado is not None:
     try:
         excel_file = pd.ExcelFile(archivo_cargado)
         hojas_disponibles = excel_file.sheet_names
         
-        st.sidebar.success("📊 Archivo detectado correctamente")
+        # Filtrar pestañas operativas (omitir hojas de Kardex si las hay para buscar solo las matrices de fórmulas)
+        pestanas_formulas = [h for h in hojas_disponibles if 'kardex' not in h.lower()]
         
-        # --- PROCESAMIENTO DE MATERIAS PRIMAS Y COSTOS ---
-        data_formulas = []
-        mapeo_hojas = {'PB': 'F.PB', 'Ant': 'F.PYAnterior', 'Act': 'F.PYActual'}
+        st.sidebar.success(f"📊 Pestañas encontradas: {pestanas_formulas}")
         
-        for label, hoja in mapeo_hojas.items():
-            if hoja in hojas_disponibles:
-                df = pd.read_excel(archivo_cargado, sheet_name=hoja, dtype={'SKU': str, 'Dummy': str})
-                id_cols = [c for c in ['Dummy', 'Mes', 'SKU', 'Nombre del producto', 'Proyecto', 'Año'] if c in df.columns]
-                mp_cols = [col for col in df.columns if col not in id_cols]
+        data_formulas_TOTAL = []
+        data_nutrientes_TOTAL = []
+        
+        for hoja in pestanas_formulas:
+            # Lectura inicial cruda para escanear las coordenadas de las tablas
+            df_crudo = pd.read_excel(archivo_cargado, sheet_name=hoja, header=None)
+            
+            fila_inicio_mp = None
+            fila_inicio_nut = None
+            
+            # Localizar dinámicamente dónde empieza el bloque de Composición y dónde el de Análisis
+            for idx, row in df_crudo.iterrows():
+                row_str = [str(x).strip() for x in row.values]
+                if "Composición" in row_str or ("Cód." in row_str and "Materia prima" in row_str):
+                    if fila_inicio_mp is None:
+                        fila_inicio_mp = idx
+                if "Análisis" in row_str or "Tipo de característica" in row_str:
+                    fila_inicio_nut = idx
+                    break
+            
+            # --- PROCESAMIENTO HOJA 1: MATERIAS PRIMAS + COSTO ---
+            if fila_inicio_mp is not None:
+                # Extraer metadatos de la parte superior (Año, Mes, Grupo, Carpeta)
+                # Buscamos valores de referencia en las primeras filas
+                grupo_val = df_crudo.iloc[1, 1] if df_crudo.shape[1] > 1 else hoja
+                establecimiento = df_crudo.iloc[2, 1] if df_crudo.shape[1] > 1 else ""
                 
-                df_v = df.melt(id_vars=id_cols, value_vars=mp_cols, var_name='Cod MP', value_name='Inclusion')
-                df_v['Escenario'] = label
-                data_formulas.append(df_v)
-        
-        if data_formulas:
-            master_f = pd.concat(data_formulas).dropna(subset=['Inclusion'])
-            master_f = master_f[master_f['Inclusion'] > 0]
-            
-            precio_kpb = pd.DataFrame(columns=['Cod MP', 'Mes', 'Precio'])
-            precio_kact = pd.DataFrame(columns=['Cod MP', 'Mes', 'Precio'])
-            
-            if 'Kardex_PB' in hojas_disponibles:
-                precio_kpb = pd.read_excel(archivo_cargado, sheet_name='Kardex_PB', dtype={'Cod MP': str})
-            if 'Kardex_Actual' in hojas_disponibles:
-                precio_kact = pd.read_excel(archivo_cargado, sheet_name='Kardex_Actual', dtype={'Cod MP': str})
-            
-            for k_df in [precio_kpb, precio_kact]:
-                if 'Código' in k_df.columns: k_df.rename(columns={'Código': 'Cod MP'}, inplace=True)
-                if 'Materia prima' in k_df.columns: k_df.rename(columns={'Materia prima': 'Cod MP'}, inplace=True)
-            
-            df_costos = pd.merge(master_f, precio_kpb[['Cod MP', 'Mes', 'Precio']].drop_duplicates(), on=['Cod MP', 'Mes'], how='left')
-            df_costos = pd.merge(df_costos, precio_kact[['Cod MP', 'Mes', 'Precio']].drop_duplicates(), on=['Cod MP', 'Mes'], how='left', suffixes=('_KPB', '_KACT'))
-            
-            df_costos['Costo_con_KPB'] = df_costos['Inclusion'] * df_costos.get('Precio_KPB', np.nan)
-            df_costos['Costo_con_KACT'] = df_costos['Inclusion'] * df_costos.get('Precio_KACT', np.nan)
-            
-            df_costos['ALERTA'] = df_costos.apply(lambda x: '🚨 FALTA PRECIO' if pd.isna(x.get('Precio_KACT', np.nan)) else '✅ OK', axis=1)
-            
-            if 'Act' in df_costos['Escenario'].values and 'PB' in df_costos['Escenario'].values:
-                resumen_recetas = df_costos.pivot_table(
-                    index=['Dummy', 'Mes'], columns='Escenario', values='Costo_con_KACT', aggfunc='sum'
-                ).reset_index()
-                if 'Act' in resumen_recetas.columns and 'PB' in resumen_recetas.columns:
-                    resumen_recetas['Diff_Act_vs_PB'] = resumen_recetas['Act'] - resumen_recetas['PB']
-            else:
-                resumen_recetas = pd.DataFrame(columns=['Dummy', 'Mes', 'Mensaje'])
-
-            # --- PROCESAMIENTO VERTICAL DE NUTRIENTES ---
-            data_nutrientes = []
-            for label, hoja in mapeo_hojas.items():
-                hoja_nut = f"Nutrientes_{label}" if f"Nutrientes_{label}" in hojas_disponibles else (hoja if hoja in hojas_disponibles else None)
-                if hoja_nut and hoja_nut in hojas_disponibles:
-                    df_n = pd.read_excel(archivo_cargado, sheet_name=hoja_nut, dtype={'SKU': str, 'Dummy': str})
-                    id_cols_n = [c for c in ['Dummy', 'Mes', 'SKU', 'Nombre del producto', 'Proyecto', 'Año', 'PY'] if c in df_n.columns]
-                    nut_cols = [col for col in df_n.columns if col not in id_cols_n]
-                    
-                    if nut_cols:
-                        df_nv = df_n.melt(id_vars=id_cols_n, value_vars=nut_cols, var_name='Cod Nutriente', value_name='Valor Nutriente')
-                        df_nv['Escenario'] = label
-                        data_nutrientes.append(df_nv)
-            
-            if data_nutrientes:
-                master_nutrientes = pd.concat(data_nutrientes).dropna(subset=['Valor Nutriente'])
-                master_nutrientes['Característica'] = master_nutrientes['Cod Nutriente']
-            else:
-                unique_dummies = master_f['Dummy'].unique() if not master_f.empty else ['DUMMY_REF']
-                ejemplo_data = []
-                nutrientes_base = {'PROT': 'Proteína Cruda', 'GRASA': 'Grasa Total', 'FIBRA': 'Fibra Cruda', 'HUM': 'Humedad Máxima'}
-                for d in unique_dummies:
-                    for cod_n, desc_n in nutrientes_base.items():
-                        ejemplo_data.append({
-                            'Dummy': d, 'Proyecto/PY': 'PY06 JUN', 'Cod Nutriente': cod_n, 'Característica': desc_n, 'Valor Nutriente': 0.0, 'Mes': 'Junio'
-                        })
-                master_nutrientes = pd.DataFrame(ejemplo_data)
-
-            # --- INTERFAZ ---
-            tab1, tab2, tab3 = st.tabs(["🛒 Costos MP", "🧬 Matriz de Nutrientes", "⚠️ Control de Precios"])
-            with tab1:
-                st.dataframe(df_costos.head(50), use_container_width=True)
-            with tab2:
-                st.dataframe(master_nutrientes, use_container_width=True)
-            with tab3:
-                faltantes = df_costos[df_costos['ALERTA'] == '🚨 FALTA PRECIO']
-                if not faltantes.empty:
-                    st.error("Materias primas sin precio registrado en el Kardex:")
-                    st.dataframe(faltantes[['Dummy', 'Mes', 'Cod MP', 'Inclusion']].drop_duplicates(), use_container_width=True)
+                df_mp = pd.read_excel(archivo_cargado, sheet_name=hoja, skiprows=fila_inicio_mp + 1)
+                
+                # Recortar la tabla justo antes de que empiece la sección de Nutrientes
+                if fila_inicio_nut is not None:
+                    df_mp = df_mp.iloc[:(fila_inicio_nut - fila_inicio_mp - 3)]
+                
+                # Limpieza de filas de totales o vacías
+                df_mp = df_mp.dropna(subset=['Cód.', 'Materia prima'], how='all')
+                df_mp = df_mp[df_mp['Cód.'] != 'Total']
+                
+                id_cols_mp = ['Cód.', 'Materia prima', 'Precio']
+                columnas_productos = [c for c in df_mp.columns if c not in id_cols_mp and 'Unnamed' not in str(c)]
+                
+                # Desdinamizar (Melt) para volverlo estructurado
+                df_mp_v = df_mp.melt(id_vars=id_cols_mp, value_vars=columnas_productos, var_name='Dummy', value_name='Peso / Inclusión')
+                
+                # Inyectar metadatos del proyecto y mes
+                df_mp_v['Proyecto'] = grupo_val
+                df_mp_v['Establecimiento'] = establecimiento
+                df_mp_v['Mes'] = "Junio"  # Puede automatizarse detectando la celda específica de tu plantilla
+                
+                # NUEVO: Cálculo e inclusión del costo solicitado
+                df_mp_v['Costo_Calculado'] = df_mp_v['Peso / Inclusión'] * df_mp_v['Precio']
+                
+                # Reordenar columnas para mantener tu esquema clásico
+                columnas_mp_final = ['Dummy', 'Proyecto', 'Establecimiento', 'Mes', 'Cód.', 'Materia prima', 'Precio', 'Peso / Inclusión', 'Costo_Calculado']
+                data_formulas_TOTAL.append(df_mp_v[columnas_mp_final])
+                
+            # --- PROCESAMIENTO HOJA 2: NUTRIENTES CON ENCABEZADO ESPEJO ---
+            if fila_inicio_nut is not None:
+                df_nut = pd.read_excel(archivo_cargado, sheet_name=hoja, skiprows=fila_inicio_nut + 1)
+                df_nut = df_nut.dropna(subset=['Cód.', 'Caracterís'], how='all')
+                
+                id_cols_nut = ['Tipo de característica', 'Cód.', 'Caracterís', 'Unidad']
+                id_cols_existentes = [c for c in id_cols_nut if c in df_nut.columns]
+                
+                columnas_valores_nut = [c for c in df_nut.columns if c not in id_cols_existentes and 'Unnamed' not in str(c)]
+                
+                # Melt de Nutrientes
+                df_nut_v = df_nut.melt(id_vars=id_cols_existentes, value_vars=columnas_valores_nut, var_name='Columna_Index', value_name='Valor Nutriente')
+                
+                # MAREAR ALINEACIÓN EN ESPEJO: Asociar el mismo Dummy/Fórmula según la posición de la columna
+                if len(columnas_productos) > 0:
+                    mapeo_espejo = dict(zip(columnas_valores_nut, columnas_productos))
+                    df_nut_v['Dummy'] = df_nut_v['Columna_Index'].map(mapeo_espejo)
                 else:
-                    st.success("✅ Todos los ingredientes tienen precios asignados.")
+                    df_nut_v['Dummy'] = df_nut_v['Columna_Index']
+                
+                df_nut_v['Proyecto'] = grupo_val
+                df_nut_v['Mes'] = "Junio"
+                
+                # Renombrar columnas para claridad del reporte
+                df_nut_v = df_nut_v.rename(columns={'Cód.': 'Cod Nutriente', 'Caracterís': 'Característica'})
+                
+                columnas_nut_final = ['Dummy', 'Proyecto', 'Mes', 'Tipo de característica', 'Cod Nutriente', 'Característica', 'Unidad', 'Valor Nutriente']
+                columnas_nut_existentes = [c for c in columnas_nut_final if c in df_nut_v.columns]
+                data_nutrientes_TOTAL.append(df_nut_v[columnas_nut_existentes])
 
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df_costos.to_excel(writer, sheet_name="DATA_PARA_POWERBI", index=False)
-                master_nutrientes.to_excel(writer, sheet_name="RELACION_NUTRIENTES", index=False)
-                if 'resumen_recetas' in locals() and not resumen_recetas.empty:
-                    resumen_recetas.to_excel(writer, sheet_name="RESUMEN_RECETAS", index=False)
+        # --- CONSOLIDACIÓN DE TABLAS ---
+        if data_formulas_TOTAL:
+            df_hoja1_ingredientes = pd.concat(data_formulas_TOTAL).dropna(subset=['Peso / Inclusión'])
+            df_hoja1_ingredientes = df_hoja1_ingredientes[df_hoja1_ingredientes['Peso / Inclusión'] > 0]
+        else:
+            df_hoja1_ingredientes = pd.DataFrame()
             
-            procesado_excel = output.getvalue()
-            st.sidebar.markdown("---")
-            st.sidebar.download_button(
-                label="📥 Descargar RESULTADO_COMPARATIVO.xlsx",
-                data=procesado_excel,
-                file_name="RESULTADO_COMPARATIVO_NUTRIENTES.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        if data_nutrientes_TOTAL:
+            df_hoja2_nutrientes = pd.concat(data_nutrientes_TOTAL).dropna(subset=['Valor Nutriente'])
+        else:
+            df_hoja2_nutrientes = pd.DataFrame()
+
+        # --- VISTA PREVIA INTERACTIVA EN STREAMLIT ---
+        tab1, tab2 = st.tabs(["🛒 Hoja 1: Ingredientes + Costos", "🧬 Hoja 2: Nutrientes (Espejo)"])
+        
+        with tab1:
+            st.subheader("Estructura de Fórmulas con Inclusión de Costo")
+            st.dataframe(df_hoja1_ingredientes, use_container_width=True)
+            
+        with tab2:
+            st.subheader("Estructura de Análisis Nutricional con Encabezado de Producto (Dummy)")
+            st.dataframe(df_hoja2_nutrientes, use_container_width=True)
+
+        # --- GENERAR EXCEL FINAL CON LAS DOS PESTAÑAS SEPARADAS ---
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            if not df_hoja1_ingredientes.empty:
+                df_hoja1_ingredientes.to_excel(writer, sheet_name="RESUMEN_INGREDIENTES_Y_COSTOS", index=False)
+            if not df_hoja2_nutrientes.empty:
+                df_hoja2_nutrientes.to_excel(writer, sheet_name="ANALISIS_NUTRIENTES_ESPEJO", index=False)
+        
+        excel_final = output.getvalue()
+        
+        st.sidebar.markdown("---")
+        st.sidebar.download_button(
+            label="📥 Descargar Reporte Multihoja",
+            data=excel_final,
+            file_name="EVALUACION_PROYECTOS_COMPLETA.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Error procesando las coordenadas del archivo: {e}")
 else:
-    st.info("💡 Sube tu archivo Excel para procesar.")
+    st.info("💡 Carga el archivo comprimido o individual de fórmulas para procesar ambas hojas en espejo.")
