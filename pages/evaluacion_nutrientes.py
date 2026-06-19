@@ -1,9 +1,38 @@
 import pandas as pd
 import streamlit as st
 import io
+import re
 
-st.title("Módulo de Separación Avanzada: Sincronización de Cabeceras")
-st.markdown("Carga tu archivo de formulación. Las cabeceras e índices se alinearán simétricamente para Ingredientes y Nutrientes.")
+st.title("Módulo de Separación Avanzada: Sincronización Estricta")
+st.markdown("Carga tu archivo de formulación. Los escenarios se normalizarán estrictamente a formatos válidos (PB, PY01, PY02, etc.).")
+
+def extraer_escenario_estricto(texto_celda):
+    """
+    Filtra rigurosamente el texto de la fila de escenarios.
+    Solo permite formatos limpios como PB, PB26, PY01, PY02, etc.
+    Si encuentra 'INB' o textos sueltos sin el patrón, busca si contiene PB o PY.
+    """
+    txt = str(texto_celda).strip().upper()
+    if txt == 'NAN' or not txt:
+        return "Actual"
+        
+    # Buscar patrones como PY01, PY02... PY11 etc.
+    match_py = re.search(r'(PY\d+)', txt)
+    if match_py:
+        return match_py.group(1)
+        
+    # Buscar patrones relacionados a Presupuesto Base (PB)
+    if 'PB' in txt:
+        match_pb = re.search(r'(PB\d*)', txt)
+        if match_pb:
+            return match_pb.group(1)
+        return "PB"
+        
+    # Si contiene palabras típicas de escenarios reales pero sin número (ej. PY01 FEB)
+    if 'PY' in txt:
+        return "PY01"
+        
+    return "Actual"
 
 def expandir_meses(rango_texto):
     meses_ano = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre']
@@ -40,7 +69,6 @@ if archivo_cargado is not None:
         data_ingredientes_total = []
         data_nutrientes_total = []
         
-        # Mapear hojas de Kardex si existen para traer precios
         k_pb = pd.read_excel(archivo_cargado, sheet_name='Kardex_PB') if 'Kardex_PB' in xl.sheet_names else None
         k_act = pd.read_excel(archivo_cargado, sheet_name='Kardex_Actual') if 'Kardex_Actual' in xl.sheet_names else None
         
@@ -50,7 +78,6 @@ if archivo_cargado is not None:
                 
             df = pd.read_excel(archivo_cargado, sheet_name=hoja, header=None)
             
-            # --- DETECTAR SECCIONES DINÁMICAMENTE ---
             idx_composicion = None
             idx_analisis = None
             idx_total_kg = None
@@ -70,27 +97,25 @@ if archivo_cargado is not None:
                 
             fin_ingredientes = idx_total_kg if idx_total_kg is not None else idx_analisis
             
-            # --- CONSTRUIR DICCIONARIO MAESTRO DE CABECERAS POR COLUMNA REAL ---
-            # Guardaremos la metadata indexada por la posición de la columna para evitar desfases
+            # --- CONSTRUCCIÓN DEL DICCIONARIO MAESTRO DE CABECERAS UNIFICADAS ---
             dict_cabeceras = {}
             
-            # Fila 5 (Estabs/Escenarios), Fila 6 (Cód. Dummies), Fila 8 (Carpetas/Meses)
+            # Analizamos las columnas válidas basándonos en la Fila 7 (Índice 6: Código Dummy)
             for col in range(2, df.shape[1]):
                 raw_dummy = str(df.iloc[6, col]).strip()
                 
-                # Si no hay un código válido en la fila 7, no es una columna de datos real
                 if raw_dummy == 'nan' or not raw_dummy or 'CÓD' in raw_dummy.upper():
                     continue
                 
+                # Fila 5 (Índice 5): Contiene los Escenarios/Estabs
                 raw_esc = str(df.iloc[5, col]).strip()
-                esc = "PB" if "PB" in raw_esc else ("Actual" if "FEB" in raw_esc or "ACT" in raw_esc or "PY" in raw_esc else raw_esc)
-                if esc == 'nan' or not esc: esc = "Actual"
+                escenario_limpio = extraer_escenario_estricto(raw_esc)
                 
                 dum = raw_dummy[:7]
                 rango_m = str(df.iloc[8, col]).strip()
                 
                 dict_cabeceras[col] = {
-                    'escenario': esc,
+                    'escenario': escenario_limpio,
                     'dummy': dum,
                     'rango_meses': rango_m
                 }
@@ -107,7 +132,6 @@ if archivo_cargado is not None:
                     if col >= df.shape[1]: continue
                     valor_inclusion = df.iloc[idx, col]
                     
-                    # Saltar si está vacío, es cero o no es numérico
                     if pd.isna(valor_inclusion) or str(valor_inclusion).strip() == '':
                         continue
                     try:
@@ -129,8 +153,6 @@ if archivo_cargado is not None:
                         })
 
             # --- PROCESAR SECCIÓN NUTRIENTES ---
-            # Identificamos en qué columna empieza el primer valor numérico de Análisis
-            # Buscando la fila donde están las palabras 'Valor'
             col_datos_analisis_inicio = 4
             for c in range(2, df.shape[1]):
                 if 'VALOR' in str(df.iloc[idx_analisis + 1, c]).upper():
@@ -146,8 +168,6 @@ if archivo_cargado is not None:
                 if cod_nut == 'nan' or not cod_nut or 'CÓD' in cod_nut.upper() or 'TIPO' in tipo_cara.upper():
                     continue
                 
-                # Recorremos las columnas numéricas de datos de análisis
-                # Ojo: la sección análisis puede estar corrida, así que nos alineamos usando el dict_cabeceras maestro
                 for col in range(col_datos_analisis_inicio, df.shape[1]):
                     valor_nutriente = df.iloc[idx, col]
                     
@@ -158,10 +178,7 @@ if archivo_cargado is not None:
                     except:
                         continue
                     
-                    # Sincronización maestra: Buscamos la cabecera correspondiente en la fila 7
-                    # Si hay un desfase de columnas visuales, lo acoplamos buscando el código de columna correcto
-                    # En tu Excel, la columna de datos de Nutrientes (col) se corresponde exactamente con la columna (col) si están alineadas,
-                    # pero si hay una columna extra de 'Valor', la corregimos dinámicamente:
+                    # Sincronización exacta usando el mapeo de columnas del diccionario maestro
                     col_maestra = col
                     if col not in dict_cabeceras and (col - 1) in dict_cabeceras:
                         col_maestra = col - 1
@@ -197,7 +214,7 @@ if archivo_cargado is not None:
             df_ing_final.drop(columns=['Cod MP_x', 'Cod MP_y'], errors='ignore', inplace=True)
 
         if not df_ing_final.empty or not df_nut_final.empty:
-            st.success("¡Estructura unificada y alineada por Código Maestro exitosamente!")
+            st.success("¡Estructura unificada y escenarios estandarizados!")
             
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
