@@ -1,128 +1,178 @@
 import pandas as pd
 import streamlit as st
 import io
+import re
 
-st.title("Transformador Masivo: Ingredientes y Nutrientes")
-st.write("Carga cualquier plantilla horizontal para separar automáticamente los ingredientes y el perfil nutricional en pestañas independientes.")
+st.title("Módulo de Separación Avanzada: Ingredientes y Nutrientes")
+st.markdown("Carga tu archivo de formulación. El sistema separará automáticamente la información en las pestañas INGREDIENTES y NUTRIENTES.")
 
-# 1. Carga del archivo de Excel
-archivo_cargado = st.file_uploader("Elige tu archivo de Excel (.xlsx)", type=["xlsx"])
+def expandir_meses(rango_texto):
+    meses_ano = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre']
+    meses_map = {m[:3].lower(): m for m in meses_ano}
+    
+    texto = str(rango_texto).strip()
+    if '-' in texto:
+        partes = texto.split('-')
+        inicio = partes[0].strip()[:3].lower()
+        fin = partes[1].strip()[:3].lower()
+        
+        if inicio in meses_map and fin in meses_map:
+            idx_inicio = meses_ano.index(meses_map[inicio])
+            idx_fin = meses_ano.index(meses_map[fin])
+            if idx_inicio <= idx_fin:
+                return meses_ano[idx_inicio:idx_fin+1]
+            else:
+                return meses_ano[idx_inicio:] + meses_ano[:idx_fin+1]
+    
+    # Si es un solo mes
+    mes_corto = texto[:3].lower()
+    if mes_corto in meses_map:
+        return [meses_map[mes_corto]]
+    
+    return [texto]
+
+archivo_cargado = st.file_uploader("Selecciona el archivo de Excel (.xlsx)", type=["xlsx"])
 
 if archivo_cargado is not None:
     try:
-        id_cols_base = ['Dummy', 'Mes', 'SKU', 'Nombre del producto']
+        xl = pd.ExcelFile(archivo_cargado)
         
         data_ingredientes_total = []
         data_nutrientes_total = []
         
-        # Leer todas las pestañas del archivo de forma dinámica
-        xl = pd.read_excel(archivo_cargado, sheet_name=None)
+        # Mapear hojas de Kardex si existen para traer precios
+        k_pb = pd.read_excel(archivo_cargado, sheet_name='Kardex_PB') if 'Kardex_PB' in xl.sheet_names else None
+        k_act = pd.read_excel(archivo_cargado, sheet_name='Kardex_Actual') if 'Kardex_Actual' in xl.sheet_names else None
         
-        # Guardamos las pestañas de Kardex si existen para el cruce de precios posterior
-        k_pb = xl.get('Kardex_PB', None)
-        k_act = xl.get('Kardex_Actual', None)
-        
-        for nombre_hoja, df in xl.items():
-            # Ignorar las pestañas de Kardex o de resultados previos durante el mapeo masivo
-            if nombre_hoja in ['Kardex_PB', 'Kardex_Actual', 'DATA_PARA_POWERBI', 'RESUMEN_RECETAS', 'ALARMAS', 'INGREDIENTES', 'NUTRIENTES']:
+        for hoja in xl.sheet_names:
+            if hoja in ['Kardex_PB', 'Kardex_Actual', 'DATA_PARA_POWERBI', 'RESUMEN_RECETAS', 'ALARMAS', 'INGREDIENTES', 'NUTRIENTES']:
                 continue
                 
-            # Validar qué columnas de identificación están presentes en esta pestaña
-            cols_presentes = [c for c in id_cols_base if c in df.columns]
-            if not cols_presentes:
-                # Si no encuentra las columnas estándar, toma las primeras 4 como identificación por seguridad
-                cols_presentes = list(df.columns[:4])
+            df = pd.read_excel(archivo_cargado, sheet_name=hoja, header=None)
             
-            # --- SEPARACIÓN DINÁMICA DE COLUMNAS ---
-            # Ingredientes: Columnas que empiezan con 'PC_'
-            cols_ingredientes = [c for c in df.columns if str(c).startswith('PC_')]
-            # Nutrientes: Columnas que NO son de identificación ni empiezan con 'PC_'
-            cols_nutrientes = [c for c in df.columns if c not in cols_presentes and c not in cols_ingredientes]
+            # --- LEER CABECERA HORIZONTAL MATRIZ ---
+            # Fila 0: Escenario (ej: PY06)
+            escenarios = [str(df.iloc[0, c]).strip() for c in range(5, df.shape[1])]
+            # Fila 1: Rango de Meses (ej: Ene - Jun)
+            rangos_meses = [str(df.iloc[1, c]).strip() for c in range(5, df.shape[1])]
+            # Fila 1: Códigos de Fórmulas / Dummies
+            dummies = [str(df.iloc[1, c]).strip() for c in range(5, df.shape[1])] # Ajustar índice si cambia de fila
             
-            # Trasponer bloque de Ingredientes (Naranja)
-            if cols_ingredientes:
-                df_ing_v = df.melt(
-                    id_vars=cols_presentes, 
-                    value_vars=cols_ingredientes, 
-                    var_name='Cod MP', 
-                    value_name='Inclusion'
-                )
-                df_ing_v['Origen_Pestaña'] = nombre_hoja
-                data_ingredientes_total.append(df_ing_v)
-                
-            # Trasponer bloque de Nutrientes (Gris)
-            if cols_nutrientes:
-                df_nut_v = df.melt(
-                    id_vars=cols_presentes, 
-                    value_vars=cols_nutrientes, 
-                    var_name='Cod Nutriente', 
-                    value_name='Valor Nutriente'
-                )
-                df_nut_v['Origen_Pestaña'] = nombre_hoja
-                data_nutrientes_total.append(df_nut_v)
-
-        # ==========================================
-        # CONSTRUCCIÓN DE LA PESTAÑA INGREDIENTES
-        # ==========================================
-        df_ingredientes_final = pd.DataFrame()
-        if data_ingredientes_total:
-            master_ing = pd.concat(data_ingredientes_total).dropna(subset=['Inclusion'])
+            # Intentar buscar dinámicamente las filas de control basadas en texto de la columna B o A
+            idx_composicion = None
+            idx_analisis = None
+            idx_total_kg = None
             
-            # Si el archivo incluye las pestañas de Kardex, hacemos el cruce de precios automáticamente
-            if k_pb is not None and k_act is not None:
-                master_ing['Cod MP'] = master_ing['Cod MP'].astype(str).str.strip()
-                k_pb['Cod MP'] = k_pb['Cod MP'].astype(str).str.strip()
-                k_act['Cod MP'] = k_act['Cod MP'].astype(str).str.strip()
-                
-                # Mapeo de precios por código y mes
-                df_ingredientes_final = pd.merge(master_ing, k_pb[['Cod MP', 'Mes', 'Precio']], on=['Cod MP', 'Mes'], how='left')
-                df_ingredientes_final = pd.merge(df_ingredientes_final, k_act[['Cod MP', 'Mes', 'Precio']], on=['Cod MP', 'Mes'], how='left', suffixes=('_KPB', '_KACT'))
-                
-                # Cálculos económicos adicionales
-                df_ingredientes_final['Costo_con_KPB'] = df_ingredientes_final['Inclusion'] * df_ingredientes_final['Precio_KPB']
-                df_ingredientes_final['Costo_con_KACT'] = df_ingredientes_final['Inclusion'] * df_ingredientes_final['Precio_KACT']
-                df_ingredientes_final['ALERTA'] = df_ingredientes_final.apply(lambda x: 'FALTA PRECIO' if pd.isna(x['Precio_KACT']) else 'OK', axis=1)
-            else:
-                df_ingredientes_final = master_ing
+            for idx, row in df.iterrows():
+                val_a = str(row[0]).strip().upper()
+                val_b = str(row[1]).strip().upper()
+                if 'COMPOSICIÓN' in val_a or 'COMPOSICIÓN' in val_b or 'COMPOSICION' in val_a or 'COMPOSICION' in val_b:
+                    idx_composicion = idx
+                if 'ANÁLISIS' in val_a or 'ANÁLISIS' in val_b or 'ANALISIS' in val_a or 'ANALISIS' in val_b:
+                    idx_analisis = idx
+                if 'TOTAL, KG' in val_b or 'TOTAL' in val_b:
+                    idx_total_kg = idx
 
-        # ==========================================
-        # CONSTRUCCIÓN DE LA PESTAÑA NUTRIENTES
-        # ==========================================
-        df_nutrientes_final = pd.DataFrame()
-        if data_nutrientes_total:
-            df_nutrientes_final = pd.concat(data_nutrientes_total).dropna(subset=['Valor Nutriente'])
+            if idx_composicion is None or idx_analisis is None:
+                continue
+                
+            fin_ingredientes = idx_total_kg if idx_total_kg is not None else idx_analisis
+            
+            # --- PROCESAR SECCIÓN INGREDIENTES (BLOQUE NARANJA) ---
+            for idx in range(idx_composicion + 2, fin_ingredientes):
+                cod_mp = str(df.iloc[idx, 0]).strip()
+                nombre_mp = str(df.iloc[idx, 1]).strip()
+                
+                if cod_mp == 'nan' or not cod_mp or 'TOTAL' in nombre_mp.upper():
+                    continue
+                    
+                for c_idx, col in enumerate(range(5, df.shape[1])):
+                    valor_inclusion = df.iloc[idx, col]
+                    if pd.isna(valor_inclusion) or float(valor_inclusion) == 0:
+                        continue
+                        
+                    esc = escenarios[c_idx] if c_idx < len(escenarios) else hoja
+                    rango_m = rangos_meses[c_idx] if c_idx < len(rangos_meses) else "Ene - Dic"
+                    dum = dummies[c_idx] if c_idx < len(dummies) else ""
+                    
+                    lista_meses = expandir_meses(rango_m)
+                    for m in lista_meses:
+                        data_ingredientes_total.append({
+                            'Escenario': esc,
+                            'Mes': m,
+                            'Cód. Dum': dum,
+                            'Cód. Mat': cod_mp,
+                            'Materia prima': nombre_mp,
+                            'Peso (Kilos)': float(valor_inclusion),
+                            'Original Fila': rango_m
+                        })
 
-        # ==========================================
-        # GENERACIÓN DEL ARCHIVO CON LAS DOS PESTAÑAS
-        # ==========================================
-        if not df_ingredientes_final.empty or not df_nutrientes_final.empty:
-            st.success("¡Estructura procesada y separada exitosamente!")
+            # --- PROCESAR SECCIÓN NUTRIENTES (BLOQUE GRIS) ---
+            for idx in range(idx_analisis + 2, df.shape[0]):
+                tipo_cara = str(df.iloc[idx, 0]).strip()
+                cod_nut = str(df.iloc[idx, 1]).strip()
+                nombre_nut = str(df.iloc[idx, 2]).strip()
+                unidad = str(df.iloc[idx, 3]).strip()
+                
+                if cod_nut == 'nan' or not cod_nut:
+                    continue
+                    
+                for c_idx, col in enumerate(range(5, df.shape[1])):
+                    valor_nutriente = df.iloc[idx, col]
+                    if pd.isna(valor_nutriente):
+                        continue
+                        
+                    esc = escenarios[c_idx] if c_idx < len(escenarios) else hoja
+                    rango_m = rangos_meses[c_idx] if c_idx < len(rangos_meses) else "Ene - Dic"
+                    dum = dummies[c_idx] if c_idx < len(dummies) else ""
+                    
+                    lista_meses = expandir_meses(rango_m)
+                    for m in lista_meses:
+                        data_nutrientes_total.append({
+                            'Escenario': esc,
+                            'Mes': m,
+                            'Cód. Dum': dum,
+                            'Tipo': tipo_cara,
+                            'Cód. Nutriente': cod_nut,
+                            'Característica': nombre_nut,
+                            'Unidad': unidad,
+                            'Valor Analítico': float(valor_nutriente),
+                            'Original Fila': rango_m
+                        })
+
+        # --- GENERAR DF E INYECTAR COSTOS KARDEX ---
+        df_ing_final = pd.DataFrame(data_ingredientes_total)
+        df_nut_final = pd.DataFrame(data_nutrientes_total)
+        
+        if not df_ing_final.empty and k_pb is not None and k_act is not None:
+            df_ing_final['Cód. Mat'] = df_ing_final['Cód. Mat'].astype(str).str.strip()
+            k_pb['Cod MP'] = k_pb['Cod MP'].astype(str).str.strip()
+            k_act['Cod MP'] = k_act['Cod MP'].astype(str).str.strip()
+            
+            df_ing_final = pd.merge(df_ing_final, k_pb[['Cod MP', 'Mes', 'Precio']], left_on=['Cód. Mat', 'Mes'], right_on=['Cod MP', 'Mes'], how='left')
+            df_ing_final = pd.merge(df_ing_final, k_act[['Cod MP', 'Mes', 'Precio']], left_on=['Cód. Mat', 'Mes'], right_on=['Cod MP', 'Mes'], how='left', suffixes=('_KPB', '_KACT'))
+            df_ing_final.drop(columns=['Cod MP_x', 'Cod MP_y'], errors='ignore', inplace=True)
+
+        if not df_ing_final.empty or not df_nut_final.empty:
+            st.success("¡Estructura idéntica procesada en dos pestañas!")
             
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                # Pestaña 1: Solo Ingredientes (con columnas fijas, códigos, inclusiones y precios si aplica)
-                if not df_ingredientes_final.empty:
-                    df_ingredientes_final.to_excel(writer, sheet_name="INGREDIENTES", index=False)
-                    st.write("### Vista previa de pestaña INGREDIENTES:")
-                    st.dataframe(df_ingredientes_final.head(5))
-                
-                # Pestaña 2: Solo Nutrientes (con columnas fijas, códigos de nutrientes y sus valores)
-                if not df_nutrientes_final.empty:
-                    df_nutrientes_final.to_excel(writer, sheet_name="NUTRIENTES", index=False)
-                    st.write("### Vista previa de pestaña NUTRIENTES:")
-                    st.dataframe(df_nutrientes_final.head(5))
-            
+                if not df_ing_final.empty:
+                    df_ing_final.to_excel(writer, sheet_name="INGREDIENTES", index=False)
+                    st.write("### Pestaña INGREDIENTES Generada:")
+                    st.dataframe(df_ing_final.head(5))
+                if not df_nut_final.empty:
+                    df_nut_final.to_excel(writer, sheet_name="NUTRIENTES", index=False)
+                    st.write("### Pestaña NUTRIENTES Generada:")
+                    st.dataframe(df_nut_final.head(5))
             output.seek(0)
             
-            # Botón único de descarga
             st.download_button(
-                label="📥 Descargar Formato Consolidado",
+                label="📥 Descargar Excel Estructurado",
                 data=output,
-                file_name="CONSOLIDADO_INGREDIENTES_Y_NUTRIENTES.xlsx",
+                file_name="RESULTADO_INGREDIENTES_Y_NUTRIENTES.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        else:
-            st.warning("No se encontraron datos estructurados válidos para procesar en el archivo.")
-
     except Exception as e:
-        st.error(f"Error durante el procesamiento del archivo: {e}")
+        st.error(f"Error procesando la matriz: {e}")
