@@ -2,16 +2,14 @@ import pandas as pd
 import streamlit as st
 import io
 
-st.title("Módulo de Separación Avanzada: Ingredientes y Nutrientes")
-st.markdown("Carga tu archivo de formulación. El sistema separará automáticamente la información en las pestañas INGREDIENTES y NUTRIENTES.")
+st.title("Módulo de Separación Avanzada: Sincronización de Cabeceras")
+st.markdown("Carga tu archivo de formulación. Las cabeceras e índices se alinearán simétricamente para Ingredientes y Nutrientes.")
 
 def expandir_meses(rango_texto):
     meses_ano = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre']
     meses_map = {m[:3].lower(): m for m in meses_ano}
     
     texto = str(rango_texto).strip()
-    
-    # Si viene con la palabra "PB" o texto extra, limpiarla para detectar el mes
     texto_limpio = texto.replace('PB', '').replace('Actual', '').strip()
     
     if '-' in texto_limpio:
@@ -27,7 +25,6 @@ def expandir_meses(rango_texto):
             else:
                 return meses_ano[idx_inicio:] + meses_ano[:idx_fin+1]
                 
-    # Intentar detectar un mes único
     for corto, largo in meses_map.items():
         if corto in texto_limpio.lower():
             return [largo]
@@ -51,18 +48,9 @@ if archivo_cargado is not None:
             if hoja in ['Kardex_PB', 'Kardex_Actual', 'DATA_PARA_POWERBI', 'RESUMEN_RECETAS', 'ALARMAS', 'INGREDIENTES', 'NUTRIENTES']:
                 continue
                 
-            # Leer el archivo sin cabecera para controlar las filas por su índice real de Excel
             df = pd.read_excel(archivo_cargado, sheet_name=hoja, header=None)
             
-            # --- COORDINADAS CORREGIDAS SEGÚN LA MATRIZ REAL ---
-            # Excel Fila 6 (Índice 5): Estab / Escenario (ej: PY11 PB26)
-            fila_escenarios = df.iloc[5, :]
-            # Excel Fila 7 (Índice 6): Cód. Dummy (ej: HD144121 -> queremos primeros 7: HD14412)
-            fila_dummies = df.iloc[6, :]
-            # Excel Fila 9 (Índice 8): Carpeta / Meses (ej: Ene - Abr 2026 PB)
-            fila_carpetas = df.iloc[8, :]
-            
-            # Buscar dinámicamente dónde empiezan las secciones Composición y Análisis
+            # --- LOCALIZACIÓN DE BLOQUES DE CONTROL ---
             idx_composicion = None
             idx_analisis = None
             idx_total_kg = None
@@ -82,10 +70,30 @@ if archivo_cargado is not None:
                 
             fin_ingredientes = idx_total_kg if idx_total_kg is not None else idx_analisis
             
-            # --- DETECTAR COLUMNAS CON DATOS (De la columna E en adelante) ---
-            columnas_datos = range(4, df.shape[1])
+            # --- CAPTURA ASOCIATIVA DE CABECERAS (Desde columna E / Índice 4 en adelante) ---
+            # Guardamos un diccionario mapeando cada columna numérica de Composición con su metadata exacta
+            mapa_cabeceras = {}
             
-            # --- PROCESAR SECCIÓN INGREDIENTES ---
+            # Fila 6 (Índice 5): Escenarios
+            # Fila 7 (Índice 6): Dummies (recorte a 7 dígitos)
+            # Fila 9 (Índice 8): Carpetas/Meses
+            for col in range(4, df.shape[1]):
+                raw_esc = str(df.iloc[5, col]).strip()
+                esc = "PB" if "PB" in raw_esc else ("Actual" if "FEB" in raw_esc or "ACT" in raw_esc else raw_esc)
+                
+                raw_dummy = str(df.iloc[6, col]).strip()
+                dum = raw_dummy[:7] if raw_dummy != 'nan' else ""
+                
+                rango_m = str(df.iloc[8, col]).strip()
+                
+                # Almacenamos la estructura limpia indexada por su posición relativa
+                mapa_cabeceras[col] = {
+                    'escenario': esc,
+                    'dummy': dum,
+                    'rango_meses': rango_m
+                }
+
+            # --- PROCESAR SECCIÓN INGREDIENTES (Datos en Columna E -> Índice 4) ---
             for idx in range(idx_composicion + 1, fin_ingredientes):
                 cod_mp = str(df.iloc[idx, 0]).strip()
                 nombre_mp = str(df.iloc[idx, 1]).strip()
@@ -93,36 +101,27 @@ if archivo_cargado is not None:
                 if cod_mp == 'nan' or not cod_mp or 'TOTAL' in nombre_mp.upper() or 'CÓD' in cod_mp.upper():
                     continue
                     
-                for col in columnas_datos:
-                    if col >= df.shape[1]: continue
+                for col in range(4, df.shape[1]):
                     valor_inclusion = df.iloc[idx, col]
-                    
                     if pd.isna(valor_inclusion) or str(valor_inclusion).strip() == '' or float(valor_inclusion) == 0:
                         continue
-                        
-                    # Extraer y limpiar metadatos de las filas superiores corregidas
-                    raw_esc = str(fila_escenarios.iloc[col]).strip()
-                    esc = "PB" if "PB" in raw_esc else ("Actual" if "FEB" in raw_esc or "ACT" in raw_esc else raw_esc)
                     
-                    # Cód Dummy: Tomar solo los primeros 7 caracteres de la celda de la Fila 7
-                    raw_dummy = str(fila_dummies.iloc[col]).strip()
-                    dum = raw_dummy[:7] if raw_dummy != 'nan' else ""
+                    meta = mapa_cabeceras[col]
+                    lista_meses = expandir_meses(meta['rango_meses'])
                     
-                    rango_m = str(fila_carpetas.iloc[col]).strip()
-                    
-                    lista_meses = expandir_meses(rango_m)
                     for m in lista_meses:
                         data_ingredientes_total.append({
-                            'Escenario': esc,
+                            'Escenario': meta['escenario'],
                             'Mes': m,
-                            'Cód. Dum': dum,
+                            'Cód. Dum': meta['dummy'],
                             'Cód. Mat': cod_mp,
                             'Materia prima': nombre_mp,
                             'Peso (Kilos)': float(valor_inclusion),
-                            'Original Fila': rango_m
+                            'Original Fila': meta['rango_meses']
                         })
 
-            # --- PROCESAR SECCIÓN NUTRIENTES ---
+            # --- PROCESAR SECCIÓN NUTRIENTES (Datos en Columna F -> Índice 5) ---
+            # El primer valor numérico de Análisis está desplazado +1 columna a la derecha
             for idx in range(idx_analisis + 1, df.shape[0]):
                 tipo_cara = str(df.iloc[idx, 0]).strip()
                 cod_nut = str(df.iloc[idx, 1]).strip()
@@ -132,36 +131,31 @@ if archivo_cargado is not None:
                 if cod_nut == 'nan' or not cod_nut or 'CÓD' in cod_nut.upper() or 'TIPO' in tipo_cara.upper():
                     continue
                     
-                for col in columnas_datos:
-                    if col >= df.shape[1]: continue
+                for col in range(5, df.shape[1]):
                     valor_nutriente = df.iloc[idx, col]
-                    
                     if pd.isna(valor_nutriente) or str(valor_nutriente).strip() == '':
                         continue
+                    
+                    # Sincronizamos restando 1 al índice de columna para acoplarnos al mapa de Composición
+                    col_cabecera_sincro = col - 1
+                    if col_cabecera_sincro in mapa_cabeceras:
+                        meta = mapa_cabeceras[col_cabecera_sincro]
+                        lista_meses = expandir_meses(meta['rango_meses'])
                         
-                    raw_esc = str(fila_escenarios.iloc[col]).strip()
-                    esc = "PB" if "PB" in raw_esc else ("Actual" if "FEB" in raw_esc or "ACT" in raw_esc else raw_esc)
-                    
-                    raw_dummy = str(fila_dummies.iloc[col]).strip()
-                    dum = raw_dummy[:7] if raw_dummy != 'nan' else ""
-                    
-                    rango_m = str(fila_carpetas.iloc[col]).strip()
-                    
-                    lista_meses = expandir_meses(rango_m)
-                    for m in lista_meses:
-                        data_nutrientes_total.append({
-                            'Escenario': esc,
-                            'Mes': m,
-                            'Cód. Dum': dum,
-                            'Tipo': tipo_cara,
-                            'Cód. Nutriente': cod_nut,
-                            'Característica': nombre_nut,
-                            'Unidad': unidad,
-                            'Valor Analítico': float(valor_nutriente),
-                            'Original Fila': rango_m
-                        })
+                        for m in lista_meses:
+                            data_nutrientes_total.append({
+                                'Escenario': meta['escenario'],
+                                'Mes': m,
+                                'Cód. Dum': meta['dummy'],
+                                'Tipo': tipo_cara,
+                                'Cód. Nutriente': cod_nut,
+                                'Característica': nombre_nut,
+                                'Unidad': unidad,
+                                'Valor Analítico': float(valor_nutriente),
+                                'Original Fila': meta['rango_meses']
+                            })
 
-        # --- GENERAR DF E INYECTAR COSTOS KARDEX ---
+        # --- CONSOLIDACIÓN FINAL E INYECCIÓN KARDEX ---
         df_ing_final = pd.DataFrame(data_ingredientes_total)
         df_nut_final = pd.DataFrame(data_nutrientes_total)
         
@@ -175,25 +169,25 @@ if archivo_cargado is not None:
             df_ing_final.drop(columns=['Cod MP_x', 'Cod MP_y'], errors='ignore', inplace=True)
 
         if not df_ing_final.empty or not df_nut_final.empty:
-            st.success("¡Estructura mapeada con cabeceras correctas y corte de Dummy a 7 dígitos!")
+            st.success("¡Sincronización de cabeceras completada exitosamente!")
             
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 if not df_ing_final.empty:
                     df_ing_final.to_excel(writer, sheet_name="INGREDIENTES", index=False)
-                    st.write("### Vista previa de INGREDIENTES:")
+                    st.write("### Vista previa de INGREDIENTES Sincronizados:")
                     st.dataframe(df_ing_final.head(5))
                 if not df_nut_final.empty:
                     df_nut_final.to_excel(writer, sheet_name="NUTRIENTES", index=False)
-                    st.write("### Vista previa de NUTRIENTES:")
+                    st.write("### Vista previa de NUTRIENTES Sincronizados:")
                     st.dataframe(df_nut_final.head(5))
             output.seek(0)
             
             st.download_button(
-                label="📥 Descargar Excel Estructurado Completo",
+                label="📥 Descargar Excel Estructurado y Sincronizado",
                 data=output,
-                file_name="RESULTADO_INGREDIENTES_Y_NUTRIENTES.xlsx",
+                file_name="CONSOLIDADO_MATRIZ_TOTAL.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
     except Exception as e:
-        st.error(f"Error procesando la matriz: {e}")
+        st.error(f"Error en el proceso de alineación: {e}")
